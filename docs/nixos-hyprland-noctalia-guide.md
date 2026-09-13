@@ -2,6 +2,14 @@
 
 A complete guide for administering, customizing, and developing within the **NixOS 26.05 (Scallop)** virtual machine environment featuring **Hyprland**, the **Noctalia Desktop Shell**, and a curated developer toolchain.
 
+> [!TIP]
+> **Automated Replicable Installer on GitHub:**  
+> This entire configuration is maintained as a turnkey repository at [antonbenosapro/nixos-hyprland-noctalia](https://github.com/antonbenosapro/nixos-hyprland-noctalia).  
+> To install on any other NixOS machine (bare-metal or VM), simply run:  
+> ```bash
+> curl -sSL https://raw.githubusercontent.com/antonbenosapro/nixos-hyprland-noctalia/main/install.sh | bash
+> ```
+
 ---
 
 ## 1. System Overview & Architecture
