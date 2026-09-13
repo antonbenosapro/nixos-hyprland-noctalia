@@ -318,3 +318,12 @@ Hyprland on NixOS uses the native Lua engine (`hyprland.lua`).
 | **Open App Launcher** | <kbd>Super</kbd> + <kbd>Space</kbd> |
 | **Cycle Wallpaper** | <kbd>Super</kbd> + <kbd>W</kbd> |
 | **Lock Screen** | <kbd>Super</kbd> + <kbd>Ctrl</kbd> + <kbd>L</kbd> |
+
+---
+
+## 9. Roadmap & Backlog (TODO)
+
+- [ ] **Custom Bootable Live ISO (`nixos-noctalia.iso`):**
+  - Create an ISO configuration profile (`iso.nix`) leveraging `<nixpkgs/nixos/modules/installer/cd-dvd/installation-cd-graphical-calamares.nix>` or `config.system.build.isoImage`.
+  - Pre-bake Hyprland, Noctalia shell, Catppuccin SDDM theme, Bibata cursors, wallpapers, and developer dotfiles directly into a live USB image.
+  - **Goal:** Boot directly into this fully-themed desktop on any bare-metal machine or laptop via flash drive without needing a base NixOS installation first, with optional automated Disko partitioning.
