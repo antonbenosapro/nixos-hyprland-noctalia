@@ -1,0 +1,349 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# nx-install: Search Nix repository, add to configuration.nix, and run nrs
+# ==============================================================================
+set -e
+
+CONFIG_FILE="/etc/nixos/configuration.nix"
+SEARCH_API_URL="https://search.nixos.org/backend/_search"
+API_USER="aWVSALXpZv"
+API_PASS="X8gPHnzL52wFEekuxsfQ9cSh"
+
+# ANSI Color formatting
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# Determine sudo invocation
+if [ "$EUID" -ne 0 ]; then
+    SUDO="sudo"
+else
+    SUDO=""
+fi
+
+usage() {
+    cat << 'EOF'
+Usage: nx-install [OPTIONS] <package-name>
+
+Searches the official NixOS package repository, displays package details,
+safely adds the package to /etc/nixos/configuration.nix (systemPackages),
+and rebuilds the system using nixos-rebuild switch (nrs).
+
+Options:
+  -s, --search       Search and display matching packages without installing
+  -y, --yes          Automatic confirmation (select best match and apply)
+  -h, --help         Show this help message
+
+Examples:
+  nx-install bat
+  nx-install vlc
+  nx-install --search discord
+  nx-install -y htop
+EOF
+    exit 0
+}
+
+SEARCH_ONLY=0
+ASSUME_YES=0
+QUERY=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            ;;
+        -s|--search)
+            SEARCH_ONLY=1
+            shift
+            ;;
+        -y|--yes)
+            ASSUME_YES=1
+            shift
+            ;;
+        -*)
+            echo -e "${RED}Error: Unknown option '$1'${NC}" >&2
+            exit 1
+            ;;
+        *)
+            if [ -z "$QUERY" ]; then
+                QUERY="$1"
+            else
+                QUERY="$QUERY $1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$QUERY" ]; then
+    echo -e "${RED}Error: Please specify a package or application name.${NC}" >&2
+    echo -e "Try 'nx-install --help' for usage."
+    exit 1
+fi
+
+echo -e "${BLUE}${BOLD}==> Searching Nix repository for '${QUERY}'...${NC}"
+
+# Query the official Elasticsearch backend
+SEARCH_PAYLOAD=$(jq -n --arg q "$QUERY" '{
+    query: {
+        multi_match: {
+            query: $q,
+            fields: ["package_attr_name^4", "package_pname^3", "package_description"]
+        }
+    },
+    size: 25
+}')
+
+API_RESPONSE=$(curl -s --connect-timeout 5 --max-time 10 \
+    -u "${API_USER}:${API_PASS}" \
+    -H "Content-Type: application/json" \
+    -X POST "${SEARCH_API_URL}" \
+    -d "$SEARCH_PAYLOAD" 2>/dev/null || true)
+
+RESULTS="[]"
+if [ -n "$API_RESPONSE" ] && echo "$API_RESPONSE" | jq -e '.hits.hits' >/dev/null 2>&1; then
+    RESULTS=$(echo "$API_RESPONSE" | jq -c --arg q "$QUERY" '
+        [ .hits.hits[]._source | {
+            attr: .package_attr_name,
+            pname: .package_pname,
+            version: (.package_pversion // "unknown"),
+            description: (.package_description // "No description provided")
+          }
+        ]
+        | unique_by(.attr)
+        | sort_by(
+            if .attr == $q then 0
+            elif .pname == $q then 1
+            elif (.attr | startswith($q)) then 2
+            else 3
+            end
+          )
+        | .[:10]
+    ')
+fi
+
+RESULT_COUNT=$(echo "$RESULTS" | jq 'length')
+
+# Fallback: if remote search returned 0 results or failed, check local nixpkgs
+if [ "$RESULT_COUNT" -eq 0 ]; then
+    echo -e "${YELLOW}Remote index returned no results. Checking local nixpkgs...${NC}"
+    LOCAL_CHECK=$(nix-instantiate --eval -E "(builtins.tryEval (let pkgs = import <nixpkgs> {}; in pkgs.${QUERY})).success" 2>/dev/null || echo "false")
+    if [ "$LOCAL_CHECK" = "true" ]; then
+        RESULTS=$(jq -n --arg attr "$QUERY" '[{ attr: $attr, pname: $attr, version: "channel", description: "Local package attribute" }]')
+        RESULT_COUNT=1
+    else
+        echo -e "${RED}❌ No packages found matching '${QUERY}'.${NC}"
+        exit 1
+    fi
+fi
+
+# Search-only mode
+if [ "$SEARCH_ONLY" -eq 1 ]; then
+    echo -e "${GREEN}${BOLD}Found ${RESULT_COUNT} package(s):${NC}\n"
+    for i in $(seq 0 $((RESULT_COUNT - 1))); do
+        ATTR=$(echo "$RESULTS" | jq -r ".[$i].attr")
+        VER=$(echo "$RESULTS" | jq -r ".[$i].version")
+        DESC=$(echo "$RESULTS" | jq -r ".[$i].description")
+        echo -e "  ${CYAN}${BOLD}${ATTR}${NC} ${DIM}(${VER})${NC}"
+        echo -e "    ${DESC}"
+    done
+    echo ""
+    exit 0
+fi
+
+# Selection logic
+SELECTED_ATTR=""
+SELECTED_VER=""
+SELECTED_DESC=""
+SHOW_MENU=0
+
+if [ "$RESULT_COUNT" -eq 1 ]; then
+    SELECTED_ATTR=$(echo "$RESULTS" | jq -r ".[0].attr")
+    SELECTED_VER=$(echo "$RESULTS" | jq -r ".[0].version")
+    SELECTED_DESC=$(echo "$RESULTS" | jq -r ".[0].description")
+    echo -e "${GREEN}Found package match:${NC}"
+    echo -e "  • ${BOLD}Attribute:${NC}   ${CYAN}${SELECTED_ATTR}${NC}"
+    echo -e "  • ${BOLD}Version:${NC}     ${SELECTED_VER}"
+    echo -e "  • ${BOLD}Description:${NC} ${SELECTED_DESC}"
+    echo ""
+else
+    # Check if there is an exact attribute or package name match
+    EXACT_INDEX=$(echo "$RESULTS" | jq --arg q "$QUERY" 'map(.attr == $q or .pname == $q) | index(true)')
+    if [ "$EXACT_INDEX" != "null" ]; then
+        EXACT_ATTR=$(echo "$RESULTS" | jq -r ".[$EXACT_INDEX].attr")
+        EXACT_VER=$(echo "$RESULTS" | jq -r ".[$EXACT_INDEX].version")
+        EXACT_DESC=$(echo "$RESULTS" | jq -r ".[$EXACT_INDEX].description")
+
+        if [ "$ASSUME_YES" -eq 1 ]; then
+            SELECTED_ATTR="$EXACT_ATTR"
+            SELECTED_VER="$EXACT_VER"
+            SELECTED_DESC="$EXACT_DESC"
+        else
+            echo -e "${GREEN}${BOLD}Exact match found:${NC}"
+            echo -e "  • ${BOLD}Attribute:${NC}   ${CYAN}${EXACT_ATTR}${NC}"
+            echo -e "  • ${BOLD}Version:${NC}     ${EXACT_VER}"
+            echo -e "  • ${BOLD}Description:${NC} ${EXACT_DESC}"
+            
+            OTHER_COUNT=$((RESULT_COUNT - 1))
+            if [ "$OTHER_COUNT" -gt 0 ]; then
+                echo -e "  ${DIM}(Found ${OTHER_COUNT} other related package(s). Type 'list' to view all)${NC}"
+            fi
+            echo ""
+
+            read -r -p "Install '${EXACT_ATTR}'? [Y/n/list]: " USER_PICK
+            case "$USER_PICK" in
+                [lL]|[lL][iI][sS][tT])
+                    SHOW_MENU=1
+                    ;;
+                [nN]|[nN][oO])
+                    echo "Cancelled."
+                    exit 0
+                    ;;
+                *)
+                    SELECTED_ATTR="$EXACT_ATTR"
+                    SELECTED_VER="$EXACT_VER"
+                    SELECTED_DESC="$EXACT_DESC"
+                    ;;
+            esac
+        fi
+    else
+        SHOW_MENU=1
+    fi
+
+    if [ "$SHOW_MENU" -eq 1 ] && [ -z "$SELECTED_ATTR" ]; then
+        echo -e "${GREEN}${BOLD}Found multiple packages:${NC}\n"
+        for i in $(seq 0 $((RESULT_COUNT - 1))); do
+            ATTR=$(echo "$RESULTS" | jq -r ".[$i].attr")
+            VER=$(echo "$RESULTS" | jq -r ".[$i].version")
+            DESC=$(echo "$RESULTS" | jq -r ".[$i].description")
+            NUM=$((i + 1))
+            echo -e "  ${YELLOW}[$NUM]${NC} ${CYAN}${BOLD}${ATTR}${NC} ${DIM}(${VER})${NC}"
+            echo -e "      ${DESC}"
+        done
+        echo ""
+
+        if [ "$ASSUME_YES" -eq 1 ]; then
+            SELECTED_ATTR=$(echo "$RESULTS" | jq -r ".[0].attr")
+            SELECTED_VER=$(echo "$RESULTS" | jq -r ".[0].version")
+            SELECTED_DESC=$(echo "$RESULTS" | jq -r ".[0].description")
+            echo -e "Selecting top match: ${CYAN}${SELECTED_ATTR}${NC}"
+        else
+            while true; do
+                read -r -p "Select package to install [1-${RESULT_COUNT}] (or 'q' to abort): " CHOICE
+                if [[ "$CHOICE" =~ ^[qQ]$ ]]; then
+                    echo "Cancelled."
+                    exit 0
+                fi
+                if [[ "$CHOICE" =~ ^[0-9]+$ ]] && [ "$CHOICE" -ge 1 ] && [ "$CHOICE" -le "$RESULT_COUNT" ]; then
+                    IDX=$((CHOICE - 1))
+                    SELECTED_ATTR=$(echo "$RESULTS" | jq -r ".[$IDX].attr")
+                    SELECTED_VER=$(echo "$RESULTS" | jq -r ".[$IDX].version")
+                    SELECTED_DESC=$(echo "$RESULTS" | jq -r ".[$IDX].description")
+                    break
+                else
+                    echo -e "${RED}Invalid selection. Please enter a number between 1 and ${RESULT_COUNT}.${NC}"
+                fi
+            done
+        fi
+    fi
+fi
+
+# Check if already installed in configuration.nix
+check_already_installed() {
+    local attr="$1"
+    local escaped_attr="${attr//./\\.}"
+    sed -n '/environment\.systemPackages/,/^[[:space:]]*\];/p' "$CONFIG_FILE" | grep -q -E "^[[:space:]]*${escaped_attr}([[:space:]]+|$)"
+}
+
+if check_already_installed "$SELECTED_ATTR"; then
+    echo -e "${YELLOW}ℹ️  Package '${SELECTED_ATTR}' is already configured in ${CONFIG_FILE}.${NC}"
+    exit 0
+fi
+
+# Validate attribute with local Nix evaluation
+echo -e "${BLUE}==> Validating package attribute with local nixpkgs...${NC}"
+EVAL_OK=$(nix-instantiate --eval -E "(builtins.tryEval (let pkgs = import <nixpkgs> {}; in pkgs.${SELECTED_ATTR})).success" 2>/dev/null || echo "false")
+
+if [ "$EVAL_OK" != "true" ]; then
+    echo -e "${YELLOW}⚠️  Warning: Attribute 'pkgs.${SELECTED_ATTR}' failed local evaluation in current channel.${NC}"
+    echo -e "   This may require an unfree license exception, flake input, or channel update."
+    if [ "$ASSUME_YES" -ne 1 ]; then
+        read -r -p "Do you still want to proceed adding it? [y/N]: " CONFIRM_PROCEED
+        if [[ ! "$CONFIRM_PROCEED" =~ ^[yY]([eE][sS])?$ ]]; then
+            echo "Aborted."
+            exit 1
+        fi
+    fi
+fi
+
+# Confirmation prompt (skip if already confirmed in exact match prompt or if ASSUME_YES)
+if [ "$ASSUME_YES" -ne 1 ] && [ "$SHOW_MENU" -eq 1 ]; then
+    read -r -p "Add '${SELECTED_ATTR}' to ${CONFIG_FILE} and run nrs? [Y/n]: " CONFIRM_INSTALL
+    if [[ "$CONFIRM_INSTALL" =~ ^[nN]([oO])?$ ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+fi
+
+# Safely edit /etc/nixos/configuration.nix
+BACKUP_FILE="${CONFIG_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
+echo -e "${BLUE}==> Backing up ${CONFIG_FILE} to ${BACKUP_FILE}...${NC}"
+$SUDO cp "$CONFIG_FILE" "$BACKUP_FILE"
+
+TMP_CONF=$(mktemp /tmp/nixos-config.XXXXXX)
+
+# Insert package into environment.systemPackages right before the closing ];
+awk -v pkg="    ${SELECTED_ATTR}" '
+    /environment\.systemPackages[[:space:]]*=[[:space:]]*with[[:space:]]+pkgs;[[:space:]]*\[/ { in_pkg=1 }
+    in_pkg && /^[[:space:]]*\];/ {
+        print pkg
+        in_pkg=0
+    }
+    { print }
+' "$CONFIG_FILE" > "$TMP_CONF"
+
+# Verify syntax before applying
+if ! nix-instantiate --parse "$TMP_CONF" >/dev/null 2>&1; then
+    echo -e "${RED}❌ Syntax check failed on modified configuration! Restoring original file...${NC}" >&2
+    rm -f "$TMP_CONF"
+    exit 1
+fi
+
+$SUDO cp "$TMP_CONF" "$CONFIG_FILE"
+rm -f "$TMP_CONF"
+echo -e "${GREEN}==> Added '${SELECTED_ATTR}' to ${CONFIG_FILE}.${NC}"
+
+# Rebuild system
+echo -e "\n${MAGENTA}${BOLD}======================================================${NC}"
+echo -e "${MAGENTA}${BOLD}==> Rebuilding NixOS system (sudo nixos-rebuild switch)${NC}"
+echo -e "${MAGENTA}${BOLD}======================================================${NC}\n"
+
+if $SUDO nixos-rebuild switch; then
+    echo -e "\n${GREEN}${BOLD}======================================================${NC}"
+    echo -e "${GREEN}${BOLD}✅ Successfully installed '${SELECTED_ATTR}'!${NC}"
+    echo -e "${GREEN}${BOLD}======================================================${NC}\n"
+else
+    echo -e "\n${RED}${BOLD}======================================================${NC}"
+    echo -e "${RED}${BOLD}❌ nixos-rebuild switch failed!${NC}"
+    echo -e "${RED}${BOLD}======================================================${NC}\n"
+    
+    if [ "$ASSUME_YES" -eq 1 ]; then
+        REVERT="y"
+    else
+        read -r -p "Would you like to revert ${CONFIG_FILE} to the backup? [Y/n]: " REVERT
+    fi
+
+    if [[ ! "$REVERT" =~ ^[nN]([oO])?$ ]]; then
+        $SUDO cp "$BACKUP_FILE" "$CONFIG_FILE"
+        echo -e "${YELLOW}==> Configuration restored to original state.${NC}"
+        echo -e "${BLUE}==> Switching back to previous working system...${NC}"
+        $SUDO nixos-rebuild switch
+    fi
+    exit 1
+fi
